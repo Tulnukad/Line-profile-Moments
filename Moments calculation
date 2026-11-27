@@ -1,0 +1,171 @@
+#Moments calculation-last version.
+import os
+import glob
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy.special import wofz
+# Define the Voigt profile function
+def voigt_profile(v, amplitude, center, sigma, gamma):
+    z = ((v - center) + 1j * gamma) / (sigma * np.sqrt(2))
+    return amplitude * np.real(wofz(z)) / (sigma * np.sqrt(2 * np.pi))
+
+# Function to calculate moments from a spectrum over a given velocity range.
+# Returns: M0 (EW-like), centroid (km/s), M2 (variance), M3 (third moment about centroid)
+def calculate_moments(velocity, flux, delta_x):
+    w = (1.0 - flux)  # weight for absorption (if emission, adjust sign convention)
+    M0 = np.sum(w * delta_x)
+    if M0 == 0 or np.isnan(M0):
+        return np.nan, np.nan, np.nan, np.nan
+    M1 = np.sum(w * (velocity-42) * delta_x) / M0
+    M2 = np.sum(w * (velocity-42)**2 * delta_x) / M0
+    M3 = np.sum(w * (velocity-42)**3 * delta_x) / M0
+    return M0, M1, M2, M3
+
+# Folder path containing spectra and JD file
+folder_path = '/content/'
+
+# Find the JD file (assuming a specific name)
+jd_files = glob.glob(os.path.join(folder_path, '/content/JD_2015.dat'))
+if len(jd_files) == 0:
+    raise FileNotFoundError("No JD file found in the folder!")
+jd_file = jd_files[0]
+
+# Load JD times
+jd_times = np.loadtxt(jd_file)
+if len(jd_times) == 0:
+    raise ValueError("JD file is empty!")
+
+# Get list of .dat files (excluding the JD file)
+all_dat_files = glob.glob(os.path.join(folder_path, '*.dat'))
+
+# Sort by filename (alphabetical order)
+all_dat_files = sorted(all_dat_files, key=lambda x: os.path.basename(x))
+
+# Exclude the JD file
+dat_files = [f for f in all_dat_files if os.path.basename(f) != os.path.basename(jd_file)]
+
+
+if len(jd_times) != len(dat_files):
+    raise ValueError(f"Mismatch: {len(jd_times)} JD values but {len(dat_files)} spectra!")
+
+output_file = os.path.join(folder_path, 'Moments_2015.dat')
+
+M0_list, M1_list, M2_list, M3_list = [], [], [], []
+JD_list = []
+
+with open(output_file, 'w') as f_out:
+    f_out.write("JD\tM0\tM1\tM2\tM3\n")
+
+    for i, file_path in enumerate(dat_files):
+        try:
+            data = np.loadtxt(file_path)
+        except Exception as e:
+            print(f"Error reading {os.path.basename(file_path)}: {e}")
+            continue
+
+        velocity, flux = data[:, 0], data[:, 1]
+
+        # --- Fit Voigt on the entire available velocity array (entire line profile) ---
+        # Good initial guesses and bounds:
+        # We fit (flux - 1) because continuum ~1.
+        y = flux - 1.0
+
+        # amplitude guess: deepest point (likely negative for absorption)
+        amplitude_guess = np.min(y)
+        center_guess = velocity[np.argmin(y)]
+        # sigma guess: a fraction of the full width of the provided velocity array
+        sigma_guess = (velocity.max() - velocity.min())
+        gamma_guess = sigma_guess
+
+        p0 = [amplitude_guess, center_guess, sigma_guess, gamma_guess]
+
+        # bounds: amplitude negative (absorption), center within velocity range, sigma/gamma positive
+        lower = [-np.inf, velocity.min(), 1e-6, 1e-6]
+        upper = [0.0, velocity.max(), np.inf, np.inf]
+
+        try:
+            popt, pcov = curve_fit(voigt_profile, velocity, y, p0=p0, bounds=(lower, upper), maxfev=40000)
+            amplitude, center_voigt, sigma, gamma = popt
+        except Exception as e:
+            print(f"Voigt fit failed for {os.path.basename(file_path)}: {e}")
+            continue
+
+        # --- Use Voigt center to define the moments window; do NOT refit here ---
+        # Moment window: center_voigt ± 150 km/s
+        range_min, range_max = center_voigt - 150.0, center_voigt + 150.0
+        mask = (velocity >= range_min) & (velocity <= range_max)
+        if np.count_nonzero(mask) < 3:
+            print(f"Too few points in moment window for {os.path.basename(file_path)}; skipping.")
+            continue
+
+        velocity_range = velocity[mask]
+        flux_range = flux[mask]
+        # delta_x: mean spacing (handle possible irregular spacing)
+        delta_x = np.diff(velocity_range).mean()
+
+        # --- Calculate moments using weights (1 - flux) inside the restricted range ---
+        M0, M1, M2, M3 = calculate_moments(velocity_range, flux_range, delta_x)
+
+        # Append to lists
+        JD = jd_times[i]
+        JD_list.append(JD)
+        M0_list.append(M0)
+        # For output, set M1 to centroid_mom (absolute centroid in km/s)
+        M1_list.append(M1)
+        M2_list.append(M2)
+        M3_list.append(M3)
+
+        # Write formatted output (JD, M0, M1, M2, M3)
+        line = f"{JD:.8f}\t{M0:.2f}\t{M1:.2f}\t{M2:.0f}\t{M3:.0f}\n"
+        f_out.write(line)
+
+        print(f"File: {os.path.basename(file_path)}")
+        print(f"  JD: {JD:.8f}")
+        print(f"  Voigt center: {center_voigt:.2f} km/s")
+        print(f"  Moments (inside {center_voigt-150:.1f}..{center_voigt+150:.1f}): M0={M0:.2f}, M1={M1:.2f}, M2={M2:.0f}, M3={M3:.0f}\n")
+
+        # Plot: full spectrum with Voigt fit over full velocity array and highlight moment window
+        fitted_full = voigt_profile(velocity, amplitude, center_voigt, sigma, gamma) + 1.0
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(velocity, flux, 'k.', label='Full Data')
+        plt.plot(velocity_range, flux_range, 'b.', label='Moment Window')
+        plt.plot(velocity, fitted_full, 'r-', label='Voigt fit (full profile)')
+        plt.axvline(center_voigt, color='r', linestyle='--', alpha=0.6, label='Voigt center')
+        plt.axvspan(range_min, range_max, color='gray', alpha=0.15, label='Moment window')
+        plt.xlabel("Velocity (km/s)")
+        plt.ylabel("Normalized Flux")
+        plt.title(f"{os.path.basename(file_path)} - JD {JD:.5f}")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+print("Processing complete. Moments saved to:", output_file)
+
+# ---- Plot Moments vs. JD ----
+#plt.figure(figsize=(12, 10))
+
+#plt.subplot(411)
+#plt.plot(JD_list, M0_list, 'ko', markersize=3)
+#plt.ylabel("M0 (EW)")
+#plt.xticks([])
+
+#plt.subplot(412)
+#plt.plot(JD_list, M1_list, 'bo', markersize=3)
+#plt.ylabel("M1 (Centroid, km/s)")
+#plt.xticks([])
+
+#plt.subplot(413)
+#plt.plot(JD_list, M2_list, 'ro', markersize=3)
+#plt.ylabel("M2 (Width)")
+#plt.xticks([])
+
+#plt.subplot(414)
+#plt.plot(JD_list, M3_list, 'go', markersize=3)
+#plt.ylabel("M3 (Skewness)")
+#plt.xlabel("JD")
+#plt.suptitle("Spectral Line Moments Over Time")
+#plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+#plt.show()
